@@ -1,162 +1,181 @@
 import os
+import shutil
 import asyncio
 import logging
-import shutil
+import concurrent.futures
+
+from PIL import Image
+from typing import List
 from pathlib import Path
-from typing import List, Union
+from dotenv import load_dotenv, find_dotenv
 
-from aiogram import Bot, Dispatcher, executor, types
+from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher.handler import CancelHandler
-from aiogram.dispatcher.middlewares import BaseMiddleware
-from aiogram.types import ContentType
+from aiogram.utils import executor
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters import MediaGroupFilter
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import ReplyKeyboardRemove, KeyboardButton, ReplyKeyboardMarkup
 
-from convert import save_as_docx, save_as_pdf
-API_TOKEN = f"{os.environ.get('TELEGRAM_API_TOKEN')}"
-API_TOKEN = '5318990723:AAHW9D6kxRTe3tC-2rAnvW0vlEnhHjCgGaM'
+import aiogram_media_group
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 
-# Initialize bot and dispatcher
-bot = Bot(token=API_TOKEN)
+# Enable logging
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# For example use simple MemoryStorage for Dispatcher.
+# load environment variable from .env file
+load_dotenv(find_dotenv())
+
+# get TOKEN from environment variable
+TOKEN = os.getenv('TOKEN')
+
+bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-BASE_DIR = Path(__file__).resolve().parent
-MEDIA_FOLDER = BASE_DIR / 'media'
-MEDIA_FOLDER.mkdir(exist_ok=True)
-DOC_FOLDER = BASE_DIR / 'documents'
-DOC_FOLDER.mkdir(exist_ok=True)
+
+MEDIA_DIR = Path.cwd() / "media"
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
+user_dirs = []
 
 
-class AlbumMiddleware(BaseMiddleware):
-    """This middleware is for capturing media groups."""
-
-    album_data: dict = {}
-
-    def __init__(self, latency: Union[int, float] = 0.01):
-        """
-        You can provide custom latency to make sure
-        albums are handled properly in highland.
-        """
-        self.latency = latency
-        super().__init__()
-
-    async def on_process_message(self, message: types.Message, data: dict):
-        if not message.media_group_id:
-            return
-
-        try:
-            self.album_data[message.media_group_id].append(message)
-            raise CancelHandler()  # Tell aiogram to cancel handler for this group element
-        except KeyError:
-            self.album_data[message.media_group_id] = [message]
-            await asyncio.sleep(self.latency)
-
-            message.conf["is_last"] = True
-            data["album"] = self.album_data[message.media_group_id]
-
-    async def on_post_process_message(self, message: types.Message, *args, **kwargs):
-        """Clean up after handling our album."""
-
-        if message.media_group_id and message.conf.get("is_last"):
-            del self.album_data[message.media_group_id]
+class PhotoConvert(StatesGroup):
+    """define state(s)"""
+    photo = State()
 
 
-@dp.message_handler(commands=['start', 'help'])
-async def send_welcome(message: types.Message):
-    """
-    This handler will be called when user sends `/start` or `/help` command
-    """
-    await message.reply('''
-    Привіт, я бот для конвертування фото твого конспекту в ворд.
-Надішліть одне або кілька фото одним повідомленням для конвертації.''')
+async def convert_images_to_pdf(image_paths: list, pdf_file_path: Path) -> None:
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        loop = asyncio.get_running_loop()
+        images = await asyncio.gather(
+            *[loop.run_in_executor(pool, Image.open, image_path) for image_path in image_paths])
+        images[0].save(str(pdf_file_path), save_all=True, append_images=images[1:])
 
 
-@dp.message_handler(content_types=types.ContentType.PHOTO)
-async def handle_photos(message: types.Message, album: List[types.Message] = None):
-    """
-    Handle multiple photos in album with AlbumMiddleware
-    or single photo in message
-    """
+@dp.message_handler(commands=['start', ])
+async def start(message: types.Message):
+    """Starts the conversation and offers to start sending photos."""
 
-    # create user directory
-    username = message.from_user.full_name
-    user_folder = MEDIA_FOLDER / username
-    user_folder.mkdir(exist_ok=True)
-
-    if not album:
-        album = [message]
-
-    # save files to user directory
-    for i, message in enumerate(album):
-        photo_filepath = user_folder / (username + str(i) + '.jpg')
-        await message.photo[-1].download(destination_file=photo_filepath)
-
-    # Inline buttons to choose format of the output file
-    available_types = ['pdf', 'docx']
-    keyboard_markup = types.InlineKeyboardMarkup(row_width=2)
-    row_buttons = (types.InlineKeyboardButton(text=t.upper(), callback_data=t) for t in available_types)
-    keyboard_markup.row(*row_buttons)
-
-    await message.reply('Виберіть формат для збереження файлу:', reply_markup=keyboard_markup)
+    await message.answer(
+        "Hi! I am here to convert your photos into a single PDF file.\n"
+        "Send photos in form of album or separate photos.\n"
+        "If you want to start conversion type /convert.\n"
+        "If you dont want this pdf or want to start over type /cancel."
+    )
 
 
-@dp.callback_query_handler(text='pdf')
-@dp.callback_query_handler(text='docx')
-async def inline_kb_answer_callback_handler(query: types.CallbackQuery):
-    """
-    Saves file after user chooses format by clicking button
-    """ 
-    answer_data = query.data
+@dp.message_handler(MediaGroupFilter(is_media_group=False), content_types=[types.ContentType.PHOTO])
+async def handle_photo(message: types.Message, state: FSMContext):
+    """Stores received photo and asks if user wants to send another one."""
+    user = message.from_user
 
-    # always answer callback queries
-    await query.answer(f'Saving as {answer_data!r}')
+    # Create dir for user to store photo files in there
+    user_dir = MEDIA_DIR / str(user.id)
+    user_dir.mkdir(parents=True, exist_ok=True)
 
-    username = query.from_user.full_name
-    user_folder = MEDIA_FOLDER / username
+    # download photo
+    photo_file = await message.photo[-1].download(destination_dir=user_dir)
 
-    if not user_folder.exists():
-        await bot.send_message(chat_id=query.from_user.id, text='Your file already saved!')
-        return
+    # add photo`s Path to state
+    async with state.proxy() as data:
+        photos = data.get("photos", [])
+    photos.append(Path(photo_file.name))
+    await state.update_data(photos=[Path(photo_file.name)])
 
-    photo_paths = sorted(list(user_folder.glob('*.jpg')), key=str)
+    # Create the inline keyboard with the "Convert" and "Cancel" buttons
+    convert_button = KeyboardButton("/convert")
+    cancel_button = KeyboardButton("/cancel")
+    reply_keyboard = ReplyKeyboardMarkup(row_width=2)
+    reply_keyboard.add(convert_button, cancel_button)
 
-    if answer_data == 'pdf':
-        filepath = DOC_FOLDER / (username + '.pdf')
-        save_as_pdf(filepath, photo_paths)
+    await message.answer("I got your first photo.\n", reply_markup=reply_keyboard)
 
-    elif answer_data == 'docx':
-        filepath = DOC_FOLDER / (username + '.docx')
-        save_as_docx(filepath, photo_paths)
-
-    else:
-        print('Unexpected message!')
-        return
-
-    await bot.send_document(chat_id=query.from_user.id, document=open(str(filepath), 'rb'))
-
-    shutil.rmtree(user_folder)  # delete user directory recursively
-    filepath.unlink()  # remove document
+    await PhotoConvert.photo.set()
 
 
-@dp.message_handler(content_types=ContentType.DOCUMENT)
-async def wrong_format(message: types.Message):
-    """
-    This handler will be called when user sends document instead of photo
-    """
+@dp.message_handler(MediaGroupFilter(is_media_group=True), content_types=types.ContentType.PHOTO, state='*')
+@aiogram_media_group.media_group_handler
+async def handle_album(messages: List[types.Message]):
+    last_message = messages[-1]
 
-    await message.reply("Фото повинні бути відправлені зі стисненням.")
+    user = last_message.from_user
+    user_dir = MEDIA_DIR / str(user.id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+
+    photo_files = [(await message.photo[-1].download(destination_dir=user_dir)).name for message in messages]
+
+    state = dp.current_state(chat=last_message.chat.id, user=user.id)
+
+    async with state.proxy() as data:
+        photos = data.get("photos", [])
+
+    photos.extend(photo_files)
+    await state.update_data(photos=photos)
+
+    # Create the inline keyboard with the "Convert" and "Cancel" buttons
+    convert_button = KeyboardButton("/convert")
+    cancel_button = KeyboardButton("/cancel")
+    reply_keyboard = ReplyKeyboardMarkup(row_width=2)
+    reply_keyboard.add(convert_button, cancel_button)
+
+    await last_message.answer("Got your photos!", reply_markup=reply_keyboard)
+    await PhotoConvert.photo.set()
 
 
-@dp.message_handler()
-async def echo(message: types.Message):
-    await message.reply("Надішліть одне або декілька фото для вставки в docx/pdf file")
+@dp.message_handler(state=PhotoConvert.photo, commands=['convert', ])
+async def make_pdf(message: types.Message, state: FSMContext):
+    """Converts photos to pdf, sends it to user and ends conversation."""
+
+    user = message.from_user
+    user_dir = MEDIA_DIR / str(user.id)
+    logger.info(f"Starting conversion of {user.first_name}'s photos")
+
+    # get photos to convert
+    async with state.proxy() as data:
+        photos = data.get("photos", [])
+
+    pdf_path = user_dir / f"{user.full_name}.pdf"
+    await convert_images_to_pdf(photos, pdf_path)
+
+    logger.info(f"Pdf for {user.first_name} generated")
+
+    with open(pdf_path, 'rb') as pdf_file:
+        await message.answer_document(document=pdf_file,
+                                      caption="Here is your PDF.\nTo make a new one send another photo.",
+                                      reply_markup=ReplyKeyboardRemove())
+
+    shutil.rmtree(user_dir)
+    await state.update_data(photos=[])
+
+    await state.finish()
 
 
-if __name__ == '__main__':
-    dp.middleware.setup(AlbumMiddleware())
+@dp.message_handler(state=PhotoConvert.photo, commands=['cancel', ])
+async def cancel(message: types.Message, state: FSMContext):
+    """Deletes user photos and ends the conversation."""
+    user = message.from_user
+    logger.info(f"{user.first_name} ended pdf creation.")
+
+    user_dir = MEDIA_DIR / str(user.id)
+    shutil.rmtree(user_dir)
+
+    await state.update_data(photos=[])
+
+    await message.answer(
+        "Bye! If you still want to create pdf file just sent photo(s).",
+        reply_markup=types.ReplyKeyboardRemove(),
+    )
+
+    await state.finish()
+
+
+def main():
+    """Run the bot."""
+    # Run the bot until KeyboardInterrupt
     executor.start_polling(dp, skip_updates=True)
+
+
+if __name__ == "__main__":
+    main()
