@@ -8,8 +8,10 @@ from PIL import Image
 from typing import List
 from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
+from pillow_heif import register_heif_opener
 
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import ContentType
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils import executor
 from aiogram.dispatcher import FSMContext
@@ -24,26 +26,29 @@ import aiogram_media_group
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# register pillow support for heif file format
+register_heif_opener()
+
 # load environment variable from .env file
 load_dotenv(find_dotenv())
 
 # get TOKEN from environment variable
 TOKEN = os.getenv('TOKEN')
+photo_extensions = ["jpg", "jpeg", "jpe", "jif", "jfif", "jfi", "png", "heic", "heif"]
+SUPPORTED_EXTENSIONS = photo_extensions + [ext.upper() for ext in photo_extensions]
 
 bot = Bot(token=TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-
 MEDIA_DIR = Path.cwd() / "media"
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
-user_dirs = []
 
-
-class PhotoConvert(StatesGroup):
+class StateChoice(StatesGroup):
     """define state(s)"""
-    photo = State()
+    pdf = State()
+    name = State()
 
 
 async def convert_images_to_pdf(image_paths: list, pdf_file_path: Path) -> None:
@@ -66,9 +71,52 @@ async def start(message: types.Message):
     )
 
 
-@dp.message_handler(MediaGroupFilter(is_media_group=False), content_types=[types.ContentType.PHOTO])
-async def handle_photo(message: types.Message, state: FSMContext):
-    """Stores received photo and asks if user wants to send another one."""
+@dp.message_handler(state=StateChoice.pdf, commands=['name', ])
+async def name_start(message: types.Message, state: FSMContext):
+    """Answer to /name command, sets name state and asks to input the name"""
+
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
+    markup.add("/cancel")
+
+    await message.answer("Send desired name for your PDF", reply_markup=markup)
+    await StateChoice.name.set()
+
+
+@dp.message_handler(state=StateChoice.name, commands=['cancel', ])
+async def cancel(message: types.Message, state: FSMContext):
+    """Deletes user photos and ends the conversation."""
+
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
+    markup.add('/name', '/convert')
+    markup.add('/cancel')
+
+    await message.answer("Name change canceled", reply_markup=markup)
+
+    await StateChoice.pdf.set()
+
+
+@dp.message_handler(state=StateChoice.name, content_types=ContentType.TEXT)
+async def name_set(message: types.Message, state: FSMContext):
+    """Sets file name to name provided in the message"""
+
+    filename = message.text
+    if not filename.endswith('.pdf'):
+        filename = filename + '.pdf'
+
+    async with state.proxy() as data:
+        data['filename'] = filename
+
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
+    markup.add('/name', '/convert')
+    markup.add('/cancel')
+
+    await message.answer(f"Set file name to '{filename}'", reply_markup=markup)
+    await StateChoice.pdf.set()
+
+
+@dp.message_handler(MediaGroupFilter(is_media_group=False), content_types=[ContentType.PHOTO, ContentType.DOCUMENT], state='*')
+async def handle_photo_or_document(message: types.Message, state: FSMContext):
+    """Stores received photo"""
     user = message.from_user
 
     # Create dir for user to store photo files in there
@@ -76,26 +124,39 @@ async def handle_photo(message: types.Message, state: FSMContext):
     user_dir.mkdir(parents=True, exist_ok=True)
 
     # download photo
-    photo_file = await message.photo[-1].download(destination_dir=user_dir)
+    if message.content_type == 'photo':
+        photo_file = await message.photo[-1].download(destination_dir=user_dir)
+    elif message.content_type == 'document':
+        file_type = message.document.file_name.split('.')[-1]
+
+        if file_type not in SUPPORTED_EXTENSIONS:
+            logger.info(f'Document type is not supported {file_type}')
+            await message.answer("Format of your file is not supported\nSupported formats: PNG, JPG, HEIC.")
+            return
+
+        photo_file = await message.document.download(destination_dir=user_dir)
+    else:
+        photo_file = None
+        logger.info("Error in handle_photo_or_document")
 
     # add photo`s Path to state
     async with state.proxy() as data:
         photos = data.get("photos", [])
+    n = len(photos) + 1
     photos.append(Path(photo_file.name))
-    await state.update_data(photos=[Path(photo_file.name)])
+    await state.update_data(photos=photos)
 
-    # Create the inline keyboard with the "Convert" and "Cancel" buttons
-    convert_button = KeyboardButton("/convert")
-    cancel_button = KeyboardButton("/cancel")
-    reply_keyboard = ReplyKeyboardMarkup(row_width=2)
-    reply_keyboard.add(convert_button, cancel_button)
+    # Create the inline keyboard with the "Convert", "Name" and "Cancel" buttons
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
+    markup.add('/name', '/convert')
+    markup.add('/cancel')
 
-    await message.answer("I got your first photo.\n", reply_markup=reply_keyboard)
+    await message.answer(f"Got your {n} photo.\n", reply_markup=markup)
 
-    await PhotoConvert.photo.set()
+    await StateChoice.pdf.set()
 
 
-@dp.message_handler(MediaGroupFilter(is_media_group=True), content_types=types.ContentType.PHOTO, state='*')
+@dp.message_handler(MediaGroupFilter(is_media_group=True), content_types=[ContentType.PHOTO, ContentType.DOCUMENT], state='*')
 @aiogram_media_group.media_group_handler
 async def handle_album(messages: List[types.Message]):
     last_message = messages[-1]
@@ -104,7 +165,24 @@ async def handle_album(messages: List[types.Message]):
     user_dir = MEDIA_DIR / str(user.id)
     user_dir.mkdir(parents=True, exist_ok=True)
 
-    photo_files = [(await message.photo[-1].download(destination_dir=user_dir)).name for message in messages]
+    if last_message.content_type == 'photo':
+        photo_files = [Path((await message.photo[-1].download(destination_dir=user_dir)).name) for message in messages]
+    elif last_message.content_type == 'document':
+        photo_files = []
+        for message in messages:
+            file_type = message.document.file_name.split('.')[-1]
+
+            if file_type not in SUPPORTED_EXTENSIONS:
+                logger.info(f'Document type is not supported {file_type}')
+                await message.answer(f"Format of your file({file_type}) is not supported\n"
+                                     f"Supported formats: PNG, JPG, HEIC.")
+                return
+
+            photo_file = Path((await message.document.download(destination_dir=user_dir)).name)
+            photo_files.append(photo_file)
+    else:
+        photo_files = []
+        logger.info("Error in handle_photo_or_document")
 
     state = dp.current_state(chat=last_message.chat.id, user=user.id)
 
@@ -115,16 +193,15 @@ async def handle_album(messages: List[types.Message]):
     await state.update_data(photos=photos)
 
     # Create the inline keyboard with the "Convert" and "Cancel" buttons
-    convert_button = KeyboardButton("/convert")
-    cancel_button = KeyboardButton("/cancel")
-    reply_keyboard = ReplyKeyboardMarkup(row_width=2)
-    reply_keyboard.add(convert_button, cancel_button)
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, selective=True)
+    markup.add('/name', '/convert')
+    markup.add('/cancel')
 
-    await last_message.answer("Got your photos!", reply_markup=reply_keyboard)
-    await PhotoConvert.photo.set()
+    await last_message.answer("Got your photos!", reply_markup=markup)
+    await StateChoice.pdf.set()
 
 
-@dp.message_handler(state=PhotoConvert.photo, commands=['convert', ])
+@dp.message_handler(state=StateChoice.pdf, commands=['convert', ])
 async def make_pdf(message: types.Message, state: FSMContext):
     """Converts photos to pdf, sends it to user and ends conversation."""
 
@@ -135,8 +212,9 @@ async def make_pdf(message: types.Message, state: FSMContext):
     # get photos to convert
     async with state.proxy() as data:
         photos = data.get("photos", [])
+        filename = data.get("filename", f"{user.full_name}.pdf")
 
-    pdf_path = user_dir / f"{user.full_name}.pdf"
+    pdf_path = user_dir / filename
     await convert_images_to_pdf(photos, pdf_path)
 
     logger.info(f"Pdf for {user.first_name} generated")
@@ -152,9 +230,10 @@ async def make_pdf(message: types.Message, state: FSMContext):
     await state.finish()
 
 
-@dp.message_handler(state=PhotoConvert.photo, commands=['cancel', ])
+@dp.message_handler(state='pdf', commands=['cancel', ])
 async def cancel(message: types.Message, state: FSMContext):
     """Deletes user photos and ends the conversation."""
+
     user = message.from_user
     logger.info(f"{user.first_name} ended pdf creation.")
 
